@@ -70,3 +70,7 @@ The entire stack is containerized using Docker Compose for a seamless setup.
 ### 7. Webserver Crash due to Flask-Session (Update)
 **Issue:** The Airflow Webserver was crashing with a `TypeError: can't compare offset-naive and offset-aware datetimes`.
 **Solution:** This is a known incompatibility with `Flask-Session==0.5.0`. Removing it wasn't enough because the container still cached it. We explicitly downgraded it by adding `Flask-Session==0.4.0` to `_PIP_ADDITIONAL_REQUIREMENTS`.
+
+### 8. Webserver Crash due to Flask-Session (Final Fix)
+**Issue:** Downgrading `Flask-Session` to `0.4.0` still resulted in timezone comparison errors on older versions of Airflow.
+**Solution:** The most robust fix is to upgrade the Airflow image from `2.8.1` to `2.9.1`, which natively resolves the dependency conflict with Flask and Werkzeug, and completely remove any hardcoded `Flask-Session` overrides.
