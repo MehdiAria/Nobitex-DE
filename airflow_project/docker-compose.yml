@@ -95,7 +95,7 @@ services:
       - postgres
 
     command: >
-      bash -c "pip install streamlit pandas psycopg2-binary -i https://mirror.arvancloud.ir/pypi/simple/ && streamlit run /app/dashboard.py --server.port=8501 --server.address=0.0.0.0"
+      bash -c "pip install streamlit pandas psycopg2-binary  && streamlit run /app/dashboard.py --server.port=8501 --server.address=0.0.0.0"
 
   minio:
     image: minio/minio:latest
