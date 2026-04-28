@@ -66,3 +66,7 @@ The entire stack is containerized using Docker Compose for a seamless setup.
 ### 6. Airflow parsing the Dashboard as a DAG
 **Issue:** The Airflow Scheduler threw a `ModuleNotFoundError: No module named 'streamlit'` because it was trying to parse `dashboard.py` as an Airflow DAG.
 **Solution:** We created an `.airflowignore` file inside the `dags/` folder containing the word `dashboard.py`. This tells the Airflow engine to ignore the dashboard file during its DAG parsing loop.
+
+### 7. Webserver Crash due to Flask-Session (Update)
+**Issue:** The Airflow Webserver was crashing with a `TypeError: can't compare offset-naive and offset-aware datetimes`.
+**Solution:** This is a known incompatibility with `Flask-Session==0.5.0`. Removing it wasn't enough because the container still cached it. We explicitly downgraded it by adding `Flask-Session==0.4.0` to `_PIP_ADDITIONAL_REQUIREMENTS`.
