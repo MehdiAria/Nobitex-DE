@@ -21,7 +21,7 @@ services:
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
       - AIRFLOW__WEBSERVER__SECRET_KEY=my_super_secret_key_12345
       # کوتیشن‌ها حذف شدند و نسخه فیکس شد
-      - _PIP_ADDITIONAL_REQUIREMENTS=pandas psycopg2-binary boto3 Flask-Session==0.5.0
+      - _PIP_ADDITIONAL_REQUIREMENTS=pandas psycopg2-binary boto3
       - _AIRFLOW_DB_UPGRADE=true
       - _AIRFLOW_WWW_USER_CREATE=true
       - _AIRFLOW_WWW_USER_USERNAME=admin
@@ -43,7 +43,7 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
       - AIRFLOW__WEBSERVER__SECRET_KEY=my_super_secret_key_12345
-      - _PIP_ADDITIONAL_REQUIREMENTS=pandas psycopg2-binary boto3 Flask-Session==0.5.0
+      - _PIP_ADDITIONAL_REQUIREMENTS=pandas psycopg2-binary boto3
     depends_on:
       - airflow-init
     volumes:
@@ -61,7 +61,7 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
       - AIRFLOW__WEBSERVER__SECRET_KEY=my_super_secret_key_12345
-      - _PIP_ADDITIONAL_REQUIREMENTS=pandas psycopg2-binary boto3 Flask-Session==0.5.0
+      - _PIP_ADDITIONAL_REQUIREMENTS=pandas psycopg2-binary boto3
     depends_on:
       - airflow-init
     volumes:
