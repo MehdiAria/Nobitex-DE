@@ -78,3 +78,7 @@ The entire stack is containerized using Docker Compose for a seamless setup.
 ### 9. Persistent Webserver Crash (Database Session Conflict)
 **Issue:** Even after upgrading Airflow to version 2.9.1 to resolve the `Flask-Session` datetime bug, the webserver continued to crash (`TypeError: can't compare offset-naive and offset-aware datetimes`). The user correctly guessed this was a database issue. The PostgreSQL `session` table still contained stale, badly formatted cookie timestamps from the previous broken package version.
 **Solution:** We modified the `airflow-init` container's startup command to include a Python `psycopg2` script that connects to the database and runs `TRUNCATE TABLE session CASCADE;` before initializing Airflow. This forcefully wipes the corrupted session cache, allowing the upgraded Airflow 2.9.1 to write fresh, correctly formatted session data.
+
+### 10. YAML Parsing Issues for Inline Python
+**Issue:** Writing inline Python scripts inside a `docker-compose.yml` command block using YAML's literal block scalar `|` can lead to unpredictable string escaping issues when parsed by Docker, leading to `SyntaxError`s inside the container.
+**Solution:** We moved the session cleanup script to an external Python file (`dags/clean_sessions.py`) that gets mounted and executed via `/opt/airflow/dags/clean_sessions.py`. This guarantees clean Python syntax execution without YAML escaping quirks.
