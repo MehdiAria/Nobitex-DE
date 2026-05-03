@@ -6,190 +6,235 @@ import boto3
 import json
 import pandas as pd
 import psycopg2
+from botocore.client import Config
 
 # ==============================================================================
-# 🎓 Data Engineering Tutorial: DAG Definition & Connections
-# آموزش مهندسی داده: تعریف DAG و اتصالات
-#
-# A DAG (Directed Acyclic Graph) is a collection of all the tasks you want to run,
-# organized in a way that reflects their relationships and dependencies.
-# یک DAG در Airflow مجموعه‌ای از وظایف است که وابستگی‌های آنها را مشخص می‌کند.
+# Connection helpers
 # ==============================================================================
 
-# ----------------- Connection Settings (تنظیمات اتصال) -----------------
 def get_s3_client():
-    # MinIO is an S3-compatible object storage server. We use it as our Data Lake.
-    # مینیو (MinIO) یک فضای ذخیره‌سازی اشیاء مانند آمازون S3 است. ما از آن به عنوان Data Lake استفاده می‌کنیم.
+    """
+    Connect to MinIO (our Data Lake) using the boto3 S3-compatible client.
+    MinIO requires path-style addressing, which we enable via the Config object.
+    Without addressing_style='path', boto3 tries virtual-hosted style URLs
+    (bucket.minio:9000) which don't resolve inside Docker.
+    """
     return boto3.client(
         's3',
         endpoint_url='http://minio:9000',
         aws_access_key_id='admin',
         aws_secret_access_key='password123',
-        region_name='us-east-1'
+        region_name='us-east-1',
+        config=Config(
+            signature_version='s3v4',
+            s3={'addressing_style': 'path'}
+        )
     )
 
+
 def get_postgres_connection():
-    # PostgreSQL acts as our Data Warehouse for structured data.
-    # پایگاه داده PostgreSQL به عنوان انبار داده (Data Warehouse) ما برای داده‌های ساختاریافته عمل می‌کند.
     return psycopg2.connect(
         host="postgres",
         database="airflow",
         user="airflow",
-        password="airflow"
+        password="airflow",
+        connect_timeout=10
     )
 
+
 # ==============================================================================
-# 🥉 BRONZE LAYER: Raw Data Ingestion
-# لایه برنز: دریافت داده‌های خام
+# BRONZE LAYER: Raw Data Ingestion
+# لایه برنز: دریافت داده‌های خام از API نوبیتکس و ذخیره در Data Lake (MinIO)
 #
-# In the medallion architecture, the Bronze layer contains raw, unprocessed data.
-# We fetch data from Nobitex API and store it exactly as we received it in MinIO.
-# در معماری مدالیون، لایه برنز شامل داده‌های خام است. ما داده‌ها را از صرافی نوبیتکس دریافت کرده
-# و دقیقاً به همان شکل در Data Lake ذخیره می‌کنیم.
+# Medallion Architecture – Bronze = raw, unmodified data exactly as received.
 # ==============================================================================
+
 def fetch_and_store_nobitex_data(**kwargs):
-    s3_client = get_s3_client()
+    s3 = get_s3_client()
+    bucket = 'crypto-raw-data'
 
-    # 1. Extract: Fetch live orderbook data
-    # ۱. استخراج: دریافت داده‌های زنده لیست سفارشات
-
-    # Create the bucket if it does not exist
-    # ساختن باکت (سطل) در صورت عدم وجود
+    # Create bucket if it does not exist yet
     try:
-        s3_client.head_bucket(Bucket='crypto-raw-data')
-    except Exception as e:
-        print('Bucket does not exist. Creating it...')
-        s3_client.create_bucket(Bucket='crypto-raw-data')
+        s3.head_bucket(Bucket=bucket)
+    except Exception:
+        s3.create_bucket(Bucket=bucket)
+        print(f"Bucket '{bucket}' created.")
 
+    # Fetch live BTC/IRT orderbook from Nobitex
     url = "https://apiv2.nobitex.ir/v3/orderbook/BTCIRT"
-    response = requests.get(url)
+    response = requests.get(url, timeout=15)
+    response.raise_for_status()
     raw_data = response.json()
+
+    # Validate that the response contains the expected fields
+    if 'bids' not in raw_data or 'asks' not in raw_data:
+        raise ValueError(f"Unexpected API response structure: {list(raw_data.keys())}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_name = f"nobitex_btc_irt_{timestamp}.json"
 
-    # 2. Load: Save to MinIO bucket
-    # ۲. بارگذاری: ذخیره در سطل MinIO
-    s3_client.put_object(
-        Bucket='crypto-raw-data',
+    s3.put_object(
+        Bucket=bucket,
         Key=file_name,
-        Body=json.dumps(raw_data).encode('utf-8'),
+        Body=json.dumps(raw_data, ensure_ascii=False).encode('utf-8'),
         ContentType='application/json'
     )
-    print(f"✅ Data saved to Data Lake as: {file_name}")
+    print(f"Bronze layer: saved {file_name} to MinIO bucket '{bucket}'")
 
-    # 3. XCom (Cross-Task Communication): Return the filename so the next task can use it
-    # ۳. ارتباط بین تسک‌ها (XCom): نام فایل را برمی‌گردانیم تا تسک بعدی بتواند از آن استفاده کند
+    # Return the filename via XCom so the next task can read the same file
     return file_name
 
 
 # ==============================================================================
-# 🥈 SILVER LAYER: Data Processing & Cleaning
-# لایه نقره‌ای: پردازش و پاک‌سازی داده‌ها
+# SILVER LAYER: Clean & Transform
+# لایه نقره‌ای: تمیزسازی و تبدیل داده با Pandas، سپس ذخیره در PostgreSQL
 #
-# The Silver layer contains filtered, cleaned, and augmented data.
-# We read the raw JSON from Bronze, process it with Pandas, and load it into Postgres.
-# لایه نقره‌ای شامل داده‌های تمیز شده و پردازش شده است. داده‌های خام را می‌خوانیم،
-# با کتابخانه قدرتمند Pandas پردازش می‌کنیم و در دیتابیس رابطه‌ای ذخیره می‌کنیم.
+# Medallion Architecture – Silver = cleaned, enriched, structured data.
 # ==============================================================================
+
 def process_orderbook_to_silver(**kwargs):
-    # 1. Get filename from XCom (the return value of the previous task)
-    # ۱. گرفتن نام فایل از XCom (مقدار بازگشتی تسک قبلی)
     ti = kwargs['ti']
     file_name = ti.xcom_pull(task_ids='ingest_to_minio')
 
-    # 2. Read raw data from MinIO
-    # ۲. خواندن داده‌های خام از MinIO
-    s3_client = get_s3_client()
-    response = s3_client.get_object(Bucket='crypto-raw-data', Key=file_name)
-    raw_content = response['Body'].read().decode('utf-8')
+    if not file_name:
+        raise ValueError("XCom returned empty filename from ingest_to_minio task.")
+
+    # Read raw JSON from MinIO (Bronze layer)
+    s3 = get_s3_client()
+    obj = s3.get_object(Bucket='crypto-raw-data', Key=file_name)
+    raw_content = obj['Body'].read().decode('utf-8')
     data = json.loads(raw_content)
 
-    # 3. Powerful Processing with PANDAS (Transform)
-    # ۳. پردازش قدرتمند با PANDAS (تبدیل داده)
-
-    # Create DataFrames for buyers (bids) and sellers (asks)
-    # ساختن دیتافریم (جدول) برای خریداران و فروشندگان
+    # Transform with Pandas
+    # Each bid/ask entry is [price, volume] in string format
     df_bids = pd.DataFrame(data.get('bids', []), columns=['price', 'volume'])
     df_asks = pd.DataFrame(data.get('asks', []), columns=['price', 'volume'])
 
-    # Convert string prices to numeric for calculations
-    # تبدیل ستون قیمت از متن به عدد برای محاسبه
     df_bids['price'] = pd.to_numeric(df_bids['price'], errors='coerce')
     df_asks['price'] = pd.to_numeric(df_asks['price'], errors='coerce')
 
-    # Fast extraction of best prices using Pandas
-    # استخراج مقادیر با سرعت بالای پانداس
-    best_bid = float(df_bids['price'].max()) if not df_bids.empty else 0
-    best_ask = float(df_asks['price'].min()) if not df_asks.empty else 0
-    spread = best_ask - best_bid # Calculate the bid-ask spread
+    # Best bid = highest price a buyer is willing to pay
+    # Best ask = lowest price a seller is willing to accept
+    best_bid = float(df_bids['price'].max()) if not df_bids.empty else 0.0
+    best_ask = float(df_asks['price'].min()) if not df_asks.empty else 0.0
+    spread = best_ask - best_bid
 
-    print(f"📊 Pandas Processing Done! Spread: {spread}")
+    last_update = data.get('lastUpdate', 0)
+    print(f"Silver layer: best_bid={best_bid:,.0f}  best_ask={best_ask:,.0f}  spread={spread:,.0f}")
 
-    # 4. Save to PostgreSQL Silver Layer (Load)
-    # ۴. ذخیره در PostgreSQL (لایه نقره‌ای)
+    # Write to PostgreSQL Silver layer
     conn = get_postgres_connection()
     cursor = conn.cursor()
 
-    # Create table if it doesn't exist
-    # ساخت جدول (اگر وجود نداشت)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS silver_orderbook (
-            id SERIAL PRIMARY KEY,
-            timestamp BIGINT,
-            best_bid NUMERIC,
-            best_ask NUMERIC,
-            spread NUMERIC,
+            id         SERIAL PRIMARY KEY,
+            last_update BIGINT,
+            best_bid   NUMERIC,
+            best_ask   NUMERIC,
+            spread     NUMERIC,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Insert data into the table
-    # ورود داده‌ها به جدول
     cursor.execute("""
-        INSERT INTO silver_orderbook (timestamp, best_bid, best_ask, spread)
+        INSERT INTO silver_orderbook (last_update, best_bid, best_ask, spread)
         VALUES (%s, %s, %s, %s)
-    """, (data.get('lastUpdate'), best_bid, best_ask, spread))
+    """, (last_update, best_bid, best_ask, spread))
 
     conn.commit()
     cursor.close()
     conn.close()
-
-    print(f"💽 Successfully saved to PostgreSQL Silver Layer!")
+    print("Silver layer: record inserted into PostgreSQL.")
 
 
 # ==============================================================================
-# ⏱️ DAG & Pipeline Configuration
-# تنظیمات پایپ‌لاین
+# GOLD LAYER: Aggregated Analytics
+# لایه طلایی: داده‌های تجمیع‌شده برای تحلیل و داشبورد
+#
+# Medallion Architecture – Gold = business-level aggregates ready for reporting.
 # ==============================================================================
+
+def aggregate_to_gold(**kwargs):
+    conn = get_postgres_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gold_hourly_stats (
+            id          SERIAL PRIMARY KEY,
+            hour_bucket TIMESTAMP,
+            avg_bid     NUMERIC,
+            avg_ask     NUMERIC,
+            avg_spread  NUMERIC,
+            min_spread  NUMERIC,
+            max_spread  NUMERIC,
+            record_count INTEGER,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Compute per-hour aggregates for hours not yet in the gold table
+    cursor.execute("""
+        INSERT INTO gold_hourly_stats
+            (hour_bucket, avg_bid, avg_ask, avg_spread, min_spread, max_spread, record_count)
+        SELECT
+            date_trunc('hour', created_at) AS hour_bucket,
+            ROUND(AVG(best_bid),  2),
+            ROUND(AVG(best_ask),  2),
+            ROUND(AVG(spread),    2),
+            ROUND(MIN(spread),    2),
+            ROUND(MAX(spread),    2),
+            COUNT(*)
+        FROM silver_orderbook
+        WHERE date_trunc('hour', created_at) NOT IN (
+            SELECT hour_bucket FROM gold_hourly_stats
+        )
+        GROUP BY date_trunc('hour', created_at)
+    """)
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("Gold layer: hourly aggregates updated.")
+
+
+# ==============================================================================
+# DAG Definition
+# ==============================================================================
+
 default_args = {
     'owner': 'mehdi_shahidi',
     'retries': 1,
-    'retry_delay': timedelta(minutes=1),
+    'retry_delay': timedelta(minutes=2),
 }
 
 with DAG(
     dag_id='nobitex_market_data_pipeline',
     default_args=default_args,
+    description='Nobitex BTC/IRT orderbook pipeline: Bronze → Silver → Gold',
     start_date=datetime(2024, 1, 1),
-    schedule_interval='*/5 * * * *', # Run every 5 minutes (اجرا هر ۵ دقیقه)
-    catchup=False # Don't backfill past missing runs (عدم اجرای تسک‌های گذشته)
+    schedule_interval='*/5 * * * *',
+    catchup=False,
+    tags=['nobitex', 'crypto', 'medallion'],
 ) as dag:
 
-    # Task 1: Ingest (Bronze)
     ingest_task = PythonOperator(
         task_id='ingest_to_minio',
         python_callable=fetch_and_store_nobitex_data,
-        provide_context=True
+        provide_context=True,
     )
 
-    # Task 2: Process (Silver)
-    process_task = PythonOperator(
+    silver_task = PythonOperator(
         task_id='process_to_silver',
         python_callable=process_orderbook_to_silver,
-        provide_context=True
+        provide_context=True,
     )
 
-    # 🔗 Define Task Dependencies
-    # تعیین ترتیب اجرا: اول دریافت داده، سپس پردازش آن
-    ingest_task >> process_task
+    gold_task = PythonOperator(
+        task_id='aggregate_to_gold',
+        python_callable=aggregate_to_gold,
+        provide_context=True,
+    )
+
+    # Bronze → Silver → Gold
+    ingest_task >> silver_task >> gold_task
