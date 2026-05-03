@@ -39,6 +39,10 @@ services:
   airflow-init:
     image: apache/airflow:2.9.1
     container_name: airflow_init
+    # 'airflow version' is the command that runs AFTER the entrypoint finishes
+    # DB migration and user creation (triggered by the env vars below).
+    # The container exits 0 when done, which satisfies service_completed_successfully.
+    command: version
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
