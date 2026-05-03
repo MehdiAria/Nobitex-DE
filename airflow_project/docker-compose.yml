@@ -1,34 +1,86 @@
+# =============================================================================
+# Docker Compose — تمام سرویس‌های پروژه
+# =============================================================================
+#
+# Docker Compose چیست؟ (برای کسی که از Django می‌آید)
+#   در Django، برای راه‌اندازی پروژه معمولاً یک دیتابیس PostgreSQL روی سیستم نصب می‌کنی
+#   و سرور را با "python manage.py runserver" اجرا می‌کنی.
+#
+#   با Docker، به جای نصب هر چیز روی سیستم، هر سرویس داخل یک "container"
+#   (ظرف جداگانه) اجرا می‌شود. docker-compose.yml تعریف می‌کند که
+#   چه containerهایی بسازد، چطور با هم ارتباط داشته باشند، و روی کدام پورت باشند.
+#
+# سرویس‌های این پروژه:
+#   1. postgres      → پایگاه داده PostgreSQL (Silver + Gold Layer)
+#   2. minio         → ذخیره‌سازی فایل S3-compatible (Bronze Layer / Data Lake)
+#   3. airflow-init  → یک‌بار اجرا می‌شود، دیتابیس را مهاجرت می‌دهد و کاربر admin می‌سازد
+#   4. airflow-webserver → رابط کاربری وب Airflow روی پورت 8080
+#   5. airflow-scheduler → پس‌زمینه که DAGها را بر اساس زمانبندی اجرا می‌کند
+#   6. streamlit     → داشبورد Python روی پورت 8501
+#   7. metabase      → داشبورد BI (Business Intelligence) روی پورت 3000
+#
+# =============================================================================
+
 version: '3.8'
 
 services:
+
+  # ===========================================================================
+  # ۱. PostgreSQL — پایگاه داده اصلی
+  # ===========================================================================
+  #
+  # چرا از PostgreSQL استفاده می‌کنیم؟
+  #   هم Airflow برای ذخیره اطلاعات DAGها و taskها نیاز به دیتابیس دارد،
+  #   هم ما جداول Silver و Gold پروژه را اینجا ذخیره می‌کنیم.
+  #   پس یک PostgreSQL برای هر دو کار کافی است.
+  #
   postgres:
-    image: postgres:16
+    image: postgres:16             # از image رسمی PostgreSQL نسخه 16 استفاده می‌کند
     container_name: airflow_postgres
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow       # نام کاربری دیتابیس
+      POSTGRES_PASSWORD: airflow   # رمز عبور دیتابیس
+      POSTGRES_DB: airflow         # نام دیتابیس که ساخته می‌شود
     volumes:
+      # داده‌های دیتابیس را در یک volume ذخیره کن تا با restart از بین نرود
       - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
 
+    # healthcheck: Docker چک می‌کند که PostgreSQL آماده پذیرش اتصال هست یا نه
+    # سرویس‌های دیگر صبر می‌کنند تا این healthcheck موفق شود
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]  # دستور چک سلامت
+      interval: 5s      # هر ۵ ثانیه چک کن
+      timeout: 5s       # اگر در ۵ ثانیه جواب نداد، شکست خورده
+      retries: 10       # تا ۱۰ بار امتحان کن
+      start_period: 10s # ۱۰ ثانیه اول را نادیده بگیر (زمان راه‌اندازی اولیه)
+
+
+  # ===========================================================================
+  # ۲. MinIO — Data Lake (ذخیره‌سازی فایل)
+  # ===========================================================================
+  #
+  # MinIO چیست؟
+  #   یک سرور ذخیره‌سازی فایل که API کاملاً مشابه Amazon S3 دارد.
+  #   ما از آن به عنوان "Data Lake" استفاده می‌کنیم:
+  #   جایی که فایل‌های JSON خام از API نوبیتکس ذخیره می‌شوند (Bronze Layer).
+  #
+  # پورت‌ها:
+  #   9000 → API (برنامه‌ها از اینجا فایل آپلود/دانلود می‌کنند)
+  #   9001 → رابط کاربری وب (در مرورگر: http://localhost:9001)
+  #
   minio:
     image: minio/minio:latest
     container_name: data_lake_minio
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"  # host:container — پورت 9000 روی کامپیوتر به 9000 container وصل است
+      - "9001:9001"  # رابط کاربری MinIO
     environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password123
+      MINIO_ROOT_USER: admin         # نام کاربری MinIO
+      MINIO_ROOT_PASSWORD: password123  # رمز عبور MinIO
     command: server /data --console-address ":9001"
+    # --console-address ":9001" → UI را روی پورت 9001 فعال کن
     volumes:
-      - minio_data:/data
+      - minio_data:/data  # داده‌های MinIO را persistent نگه دار
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
@@ -36,34 +88,96 @@ services:
       retries: 5
       start_period: 10s
 
+
+  # ===========================================================================
+  # ۳. Airflow Init — راه‌اندازی اولیه (یک‌بار اجرا می‌شود)
+  # ===========================================================================
+  #
+  # این container فقط یک‌بار اجرا می‌شود، کارهای زیر را انجام می‌دهد و خاموش می‌شود:
+  #   1. _AIRFLOW_DB_MIGRATE=true → جداول لازم را در PostgreSQL می‌سازد
+  #      (مثل python manage.py migrate در Django)
+  #   2. _AIRFLOW_WWW_USER_CREATE=true → کاربر admin برای UI می‌سازد
+  #      (مثل python manage.py createsuperuser در Django)
+  #   3. command: version → دستور "airflow version" را اجرا می‌کند
+  #      فقط برای اینکه container با exit code 0 (موفق) خاموش شود
+  #
+  # چرا init جدا است؟
+  #   webserver و scheduler باید صبر کنند تا دیتابیس آماده باشد.
+  #   با condition: service_completed_successfully مطمئن می‌شویم
+  #   که init موفق شده قبل از راه‌اندازی بقیه.
+  #
   airflow-init:
     image: apache/airflow:2.9.1
     container_name: airflow_init
-    # 'airflow version' is the command that runs AFTER the entrypoint finishes
-    # DB migration and user creation (triggered by the env vars below).
-    # The container exits 0 when done, which satisfies service_completed_successfully.
     command: version
+    # 'airflow version' → بعد از انجام migration و ساخت user، این دستور اجرا می‌شود.
+    # نسخه Airflow را چاپ می‌کند و با exit code 0 خارج می‌شود.
+    # exit code 0 = موفق → بقیه سرویس‌ها شروع می‌شوند.
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      # LocalExecutor یعنی taskها در همان container scheduler اجرا می‌شوند.
+      # (در پروداکشن از CeleryExecutor یا KubernetesExecutor استفاده می‌شود)
+
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # آدرس اتصال به دیتابیس — فرمت: driver://user:password@host/database
+      # "postgres" در اینجا نام سرویس postgres در همین docker-compose است
+
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      # DAGهای نمونه Airflow را بارگذاری نکن (شلوغی غیرضروری)
+
       AIRFLOW__WEBSERVER__SECRET_KEY: 'nobitex-de-stable-secret-key-2024'
+      # کلید رمزنگاری session کاربران در webserver
+      # باید در تمام containerهای Airflow یکسان باشد
+      # اگر random باشد، با هر restart همه session‌ها invalid می‌شوند!
+
       AIRFLOW__WEBSERVER__SESSION_BACKEND: securecookie
+      # session‌ها را در کوکی رمزگذاری‌شده ذخیره کن (نه در دیتابیس)
+      # این از مشکل Flask-Login در webserver جلوگیری می‌کند
+
       _PIP_ADDITIONAL_REQUIREMENTS: 'pandas psycopg2-binary boto3'
+      # کتابخانه‌های اضافه که DAGهای ما نیاز دارند:
+      #   pandas → پردازش داده
+      #   psycopg2-binary → اتصال به PostgreSQL
+      #   boto3 → ارتباط با MinIO (پروتکل S3)
+      # هشدار: این روش فقط برای توسعه است! در production باید از
+      # custom Docker image استفاده کنی.
+
       _AIRFLOW_DB_MIGRATE: 'true'
+      # مثل python manage.py migrate — جداول Airflow را در PostgreSQL بساز
+
       _AIRFLOW_WWW_USER_CREATE: 'true'
+      # ساخت کاربر admin برای ورود به Airflow UI
       _AIRFLOW_WWW_USER_USERNAME: admin
       _AIRFLOW_WWW_USER_PASSWORD: admin
+
     depends_on:
       postgres:
-        condition: service_healthy
-    volumes:
-      - ./dags:/opt/airflow/dags
+        condition: service_healthy  # صبر کن تا PostgreSQL کاملاً آماده شود
 
+    volumes:
+      - ./dags:/opt/airflow/dags  # پوشه dags محلی را داخل container mount کن
+      # این یعنی تغییرات فایل‌های DAG بلافاصله داخل container اعمال می‌شود
+      # بدون نیاز به rebuild!
+
+
+  # ===========================================================================
+  # ۴. Airflow Webserver — رابط کاربری وب
+  # ===========================================================================
+  #
+  # آدرس: http://localhost:8080
+  # نام کاربری: admin
+  # رمز عبور: admin
+  #
+  # اینجا می‌توانی:
+  #   - DAGها را روشن/خاموش کنی
+  #   - اجرای دستی داشته باشی (Trigger DAG)
+  #   - لاگ هر Task را ببینی
+  #   - وضعیت اجراها را بررسی کنی
+  #
   airflow-webserver:
     image: apache/airflow:2.9.1
     container_name: airflow_webserver
-    restart: always
+    restart: always  # اگر crash کرد، Docker خودکار restart می‌کند
     command: webserver
     ports:
       - "8080:8080"
@@ -74,12 +188,30 @@ services:
       AIRFLOW__WEBSERVER__SECRET_KEY: 'nobitex-de-stable-secret-key-2024'
       AIRFLOW__WEBSERVER__SESSION_BACKEND: securecookie
       _PIP_ADDITIONAL_REQUIREMENTS: 'pandas psycopg2-binary boto3'
+
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+        # صبر کن تا airflow-init با موفقیت تمام شود (exit code 0)
+        # بدون این، webserver قبل از migration دیتابیس شروع می‌کرد و crash می‌کرد
+
     volumes:
       - ./dags:/opt/airflow/dags
 
+
+  # ===========================================================================
+  # ۵. Airflow Scheduler — موتور زمانبندی
+  # ===========================================================================
+  #
+  # Scheduler پس‌زمینه کار می‌کند و:
+  #   - هر ۵ دقیقه DAG ما را اجرا می‌کند (طبق schedule_interval در DAG)
+  #   - وضعیت اجراها را در دیتابیس ثبت می‌کند
+  #   - در صورت خطا، retry می‌کند
+  #
+  # تفاوت webserver و scheduler:
+  #   webserver → فقط رابط کاربری (UI) — اگر خاموش باشد، DAGها باز اجرا می‌شوند
+  #   scheduler → موتور اجرا — اگر خاموش باشد، هیچ DAGی اجرا نمی‌شود!
+  #
   airflow-scheduler:
     image: apache/airflow:2.9.1
     container_name: airflow_scheduler
@@ -92,44 +224,97 @@ services:
       AIRFLOW__WEBSERVER__SECRET_KEY: 'nobitex-de-stable-secret-key-2024'
       AIRFLOW__WEBSERVER__SESSION_BACKEND: securecookie
       _PIP_ADDITIONAL_REQUIREMENTS: 'pandas psycopg2-binary boto3'
+
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+
     volumes:
       - ./dags:/opt/airflow/dags
+
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # این تنظیم فقط برای Linux لازم است.
+      # در Mac/Windows، "host.docker.internal" خودکار تعریف است.
+      # در Linux باید دستی اضافه شود.
+      # اگر بخواهیم از container به سرویسی روی کامپیوتر خودمان دسترسی داشته باشیم،
+      # از host.docker.internal استفاده می‌کنیم.
 
+
+  # ===========================================================================
+  # ۶. Streamlit — داشبورد Python
+  # ===========================================================================
+  #
+  # آدرس: http://localhost:8501
+  #
+  # Streamlit یک اپ Python ساده است که داده‌ها را از PostgreSQL می‌خواند
+  # و نمودار و متریک نشان می‌دهد. هر ۳۰ ثانیه خودکار رفرش می‌شود.
+  #
   streamlit:
-    image: python:3.10-slim
+    image: python:3.10-slim  # یک image سبک Python
     container_name: python_dashboard
     restart: always
     ports:
       - "8501:8501"
     volumes:
-      - ./dags:/app
+      - ./dags:/app  # پوشه dags را به /app داخل container mount کن
+      # پس dashboard.py که در dags/ است، داخل container در /app/dashboard.py خواهد بود
+
+    # دستور راه‌اندازی:
+    #   1. pip install → کتابخانه‌های لازم را نصب کن
+    #   2. streamlit run → اپ داشبورد را اجرا کن
     command: >
       bash -c "pip install streamlit pandas psycopg2-binary --quiet &&
                streamlit run /app/dashboard.py --server.port=8501 --server.address=0.0.0.0"
-    depends_on:
-      - postgres
+    # --server.address=0.0.0.0 مهم است! بدون آن، Streamlit فقط به localhost
+    # داخل container گوش می‌دهد و از بیرون (مرورگر تو) قابل دسترس نیست.
 
+    depends_on:
+      - postgres  # دیتابیس باید قبل از داشبورد راه‌اندازی شده باشد
+
+
+  # ===========================================================================
+  # ۷. Metabase — داشبورد BI (Business Intelligence)
+  # ===========================================================================
+  #
+  # آدرس: http://localhost:3000
+  #
+  # Metabase یک ابزار قدرتمند داشبورد است که:
+  #   - بدون کد به جداول PostgreSQL وصل می‌شود
+  #   - Chart، Table، Dashboard می‌سازد
+  #   - مناسب تیم‌های غیرفنی است
+  #
+  # MB_DB_* تنظیمات برای اینکه Metabase اطلاعات خودش را کجا ذخیره کند
+  # (همان PostgreSQL پروژه ما)
+  #
   metabase:
     image: metabase/metabase:latest
     container_name: metabase_dashboard
     restart: always
     ports:
-      - "3000:3000"
+      - "3000:3000"  # پورت پیش‌فرض Metabase 3000 است
     environment:
       MB_DB_TYPE: postgres
-      MB_DB_DBNAME: airflow
+      MB_DB_DBNAME: airflow    # دیتابیس Metabase در همان PostgreSQL پروژه
       MB_DB_PORT: 5432
       MB_DB_USER: airflow
       MB_DB_PASS: airflow
-      MB_DB_HOST: postgres
+      MB_DB_HOST: postgres     # نام سرویس PostgreSQL در Docker
     depends_on:
       - postgres
 
+
+# =============================================================================
+# Volumes — فضای ذخیره‌سازی پایدار
+# =============================================================================
+#
+# Volume چیست؟
+#   به‌صورت پیش‌فرض، وقتی یک container حذف می‌شود، تمام داده‌هایش از بین می‌رود.
+#   Volume یک فضای ذخیره‌سازی است که حتی بعد از حذف container هم باقی می‌ماند.
+#
+#   postgres_data → داده‌های PostgreSQL (جداول Silver, Gold و اطلاعات Airflow)
+#   minio_data    → فایل‌های JSON در MinIO (Bronze Layer)
+#
 volumes:
   postgres_data:
   minio_data:
